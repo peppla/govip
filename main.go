@@ -1,16 +1,6 @@
 // Copyright 2020 retinadata
-
+// Changes in 2025 by Pep Pla
 // Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-
-//     http://www.apache.org/licenses/LICENSE-2.0
-
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
 
 package main
 
@@ -18,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -45,6 +36,27 @@ var (
 	keyfile     = flag.String("key", "server.key", "etcd key file")
 )
 
+// Check if another machine is already using the VIP (split-brain detection)
+func isVIPActive() bool {
+	conn, err := net.DialTimeout("tcp", (*vip)+":80", 2*time.Second) // Adjust port if needed
+	if err == nil {
+		conn.Close()
+		log.Warn("VIP already in use on another machine! Split-brain detected.")
+		return true
+	}
+	return false
+}
+
+// Ensure that no stale VIP is assigned before starting election
+func cleanupStaleVIP() {
+	set, vaddr, vlink, _ := hasIP()
+	if set {
+		log.Warn("Stale VIP detected! Releasing it before election.")
+		netlink.AddrDel(vlink, vaddr)
+	}
+}
+
+// Check if this node currently holds the VIP
 func hasIP() (bool, *netlink.Addr, netlink.Link, error) {
 	vaddr, err := netlink.ParseAddr(*vip)
 	if err != nil {
@@ -67,6 +79,7 @@ func hasIP() (bool, *netlink.Addr, netlink.Link, error) {
 	return false, vaddr, vlink, nil
 }
 
+// Release the VIP when stepping down as leader
 func releaseIP() error {
 	log.Debug("Releasing IP address")
 	set, vaddr, vlink, err := hasIP()
@@ -84,8 +97,13 @@ func releaseIP() error {
 	return nil
 }
 
+// Assign VIP and send ARP announcements
 func ensureIP() (bool, error) {
 	log.Debug("Ensuring IP address")
+	if isVIPActive() { // Split-brain detection before assigning VIP
+		return false, fmt.Errorf("VIP already active on another machine")
+	}
+
 	set, vaddr, vlink, err := hasIP()
 	if err != nil {
 		return false, err
@@ -94,16 +112,35 @@ func ensureIP() (bool, error) {
 		log.Debug("IP address already set")
 		return false, nil
 	}
+
 	if err := netlink.AddrAdd(vlink, vaddr); err != nil {
 		return false, err
 	}
-	log.Info("IP address set, sending gratuitous ARPs")
-	for i := 0; i < 5; i++ {
+
+	log.Info("VIP assigned! Sending Gratuitous ARPs for faster propagation.")
+	for i := 0; i < 10; i++ { // Increase ARP frequency
 		arping.GratuitousArpOverIfaceByName(vaddr.IP, *vif)
-		time.Sleep(1 * time.Second)
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	return true, nil
+}
+
+// Monitor etcd leadership state
+func verifyLeadership(e *concurrency.Election) {
+	res, err := e.Leader(context.Background())
+	if err != nil || string(res.Kvs[0].Value) != *member {
+		log.Warn("Lost etcd leadership! Releasing VIP.")
+		releaseIP()
+	}
+}
+
+// Send alert when failover occurs
+func notifyFailover() {
+	log.Warn("Failover detected! Notifying external monitoring system.")
+	// Send webhook alert
+	http.Post("https://monitoring.example.com/webhook", "application/json",
+		strings.NewReader(`{"event": "VIP failover detected"}`))
 }
 
 func main() {
@@ -113,7 +150,12 @@ func main() {
 		return
 	}
 
-	releaseIP()
+	log.SetOutput(os.Stdout) // Log to stdout for debugging
+	file, err := os.OpenFile("/var/log/govip.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	log.SetOutput(file) // Log leadership transitions
+
+	cleanupStaleVIP() // New: Ensure VIP is clean before election
+
 	tlsInfo := transport.TLSInfo{
 		CertFile:      *certfile,
 		KeyFile:       *keyfile,
@@ -131,64 +173,37 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer cli.Close() // make sure to close the client
+	defer cli.Close()
 
-	quit := make(chan int)
-	exit := make(chan int)
 	ctx, cancel := context.WithCancel(context.Background())
+	s, err := concurrency.NewSession(cli)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer s.Close()
+	e := concurrency.NewElection(s, *prefix)
 
-	go func() {
-		defer func() { exit <- 0 }()
-		s, err := concurrency.NewSession(cli)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer s.Close()
-
-		e := concurrency.NewElection(s, *prefix)
-
-		for {
-			select {
-			case <-time.After(5 * time.Second):
-				log.Debug("Waiting to become the leader")
-				err := e.Campaign(ctx, *member)
-				if err == context.Canceled {
-					return
-				}
-				if err != nil {
-					log.Fatal(err)
-				}
-				log.Debug("I am the leader")
-
-				res, err := ensureIP()
-				if err != nil {
-					log.Fatal(err)
-				}
-				if res {
-					defer releaseIP()
-				}
-			case <-quit:
+	for {
+		select {
+		case <-time.After(5 * time.Second):
+			log.Debug("Waiting to become the leader")
+			err := e.Campaign(ctx, *member)
+			if err == context.Canceled {
 				return
 			}
-		}
-	}()
+			if err != nil {
+				log.Fatal(err)
+			}
 
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan,
-		syscall.SIGINT,
-		syscall.SIGTERM)
+			log.Infof("New leader elected: %s", *member)
+			time.Sleep(5 * time.Second) // Delay to prevent VIP flapping
 
-	go func() {
-		for {
-			s := <-signalChan
-			log.Infof("Received %v", s)
-			cancel()
-			close(quit)
-			return
+			if res, err := ensureIP(); err == nil && res {
+				defer releaseIP()
+				notifyFailover()
+			}
+
+			verifyLeadership(e) // Verify election health periodically
 		}
-	}()
-	code := <-exit
-	cli.Close()
-	log.Infof("Exiting with code: %v", code)
-	os.Exit(code)
+	}
 }
